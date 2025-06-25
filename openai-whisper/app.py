@@ -1,23 +1,25 @@
 import os
 import io
 import wave
-import httpx
 import numpy as np
-import audioop
 
-from openai import AsyncOpenAI
+
+import boto3
+import json
+import uuid
+import time
 import chainlit as cl
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Initialize AWS clients
+transcribe_client = boto3.client('transcribe', region_name=AWS_REGION)
+bedrock_client = boto3.client('bedrock-runtime', region_name=AWS_REGION)
+s3_client = boto3.client('s3', region_name=AWS_REGION)
+polly_client = boto3.client('polly', region_name=AWS_REGION)
 
-if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID or not OPENAI_API_KEY:
-    raise ValueError(
-        "OPENAI_API_KEY, ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set"
-    )
+# S3 bucket for temporary audio files
+S3_BUCKET = os.getenv("S3_BUCKET", "your-transcribe-bucket")
 
 
 # Define a threshold for detecting silence and a timeout for ending a turn
@@ -28,68 +30,114 @@ SILENCE_TIMEOUT = 1300.0  # Seconds of silence to consider the turn finished
 
 
 @cl.step(type="tool")
-async def speech_to_text(audio_file):
-    response = await openai_client.audio.transcriptions.create(
-        model="whisper-1", file=audio_file
-    )
-
-    return response.text
+async def speech_to_text(audio_buffer):
+    # Generate unique job name
+    job_name = f"transcribe-job-{uuid.uuid4()}"
+    s3_key = f"audio/{job_name}.wav"
+    
+    try:
+        # Upload audio to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=audio_buffer,
+            ContentType='audio/wav'
+        )
+        
+        # Start transcription job
+        transcribe_client.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={'MediaFileUri': f's3://{S3_BUCKET}/{s3_key}'},
+            MediaFormat='wav',
+            LanguageCode='en-US'
+        )
+        
+        # Wait for transcription to complete
+        while True:
+            response = transcribe_client.get_transcription_job(
+                TranscriptionJobName=job_name
+            )
+            status = response['TranscriptionJob']['TranscriptionJobStatus']
+            
+            if status == 'COMPLETED':
+                # Get transcript
+                transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
+                import urllib.request
+                with urllib.request.urlopen(transcript_uri) as response:
+                    transcript_data = json.loads(response.read())
+                    transcript_text = transcript_data['results']['transcripts'][0]['transcript']
+                break
+            elif status == 'FAILED':
+                raise Exception("Transcription failed")
+            
+            time.sleep(1)  # Wait 1 second before checking again
+        
+        return transcript_text
+        
+    finally:
+        # Clean up S3 object
+        try:
+            s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        except:
+            pass
 
 
 @cl.step(type="tool")
 async def text_to_speech(text: str, mime_type: str):
-    CHUNK_SIZE = 1024
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-
-    headers = {
-        "Accept": mime_type,
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY,
-    }
-
-    data = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.5},
-    }
-
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        response = await client.post(url, json=data, headers=headers)
-        response.raise_for_status()  # Ensure we notice bad responses
-
-        buffer = io.BytesIO()
-        buffer.name = f"output_audio.{mime_type.split('/')[1]}"
-
-        async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
-            if chunk:
-                buffer.write(chunk)
-
-        buffer.seek(0)
-        return buffer.name, buffer.read()
+    response = polly_client.synthesize_speech(
+        Text=text,
+        OutputFormat='mp3',
+        VoiceId='Joanna'
+    )
+    
+    audio_data = response['AudioStream'].read()
+    return "output_audio.mp3", audio_data
 
 
 @cl.step(type="tool")
 async def generate_text_answer(transcription):
     message_history = cl.user_session.get("message_history")
-
+    
+    # Add user message to history
     message_history.append({"role": "user", "content": transcription})
-
-    response = await openai_client.chat.completions.create(
-        model="gpt-4o", messages=message_history, temperature=0.2
+    
+    # Convert message history to Claude format
+    claude_messages = []
+    for msg in message_history:
+        if msg["role"] == "user":
+            claude_messages.append({"role": "user", "content": msg["content"]})
+        elif msg["role"] == "assistant":
+            claude_messages.append({"role": "assistant", "content": msg["content"]})
+    
+    # Prepare request for Claude
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "temperature": 0.2,
+        "messages": claude_messages
+    }
+    
+    # Call Bedrock
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        body=json.dumps(body)
     )
-
-    message = response.choices[0].message
-    message_history.append(message)
-
-    return message.content
+    
+    # Parse response
+    response_body = json.loads(response['body'].read())
+    assistant_message = response_body['content'][0]['text']
+    
+    # Add assistant response to history
+    message_history.append({"role": "assistant", "content": assistant_message})
+    
+    return assistant_message
 
 
 @cl.on_chat_start
 async def start():
     cl.user_session.set("message_history", [])
     await cl.Message(
-        content="Welcome to Chainlit x Whisper example! Press `p` to talk!",
+        content="Welcome to Chainlit x AWS example! Press `p` to talk!",
     ).send()
 
 
@@ -125,9 +173,8 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
     cl.user_session.set("last_elapsed_time", chunk.elapsedTime)
 
     # Compute the RMS (root mean square) energy of the audio chunk
-    audio_energy = audioop.rms(
-        chunk.data, 2
-    )  # Assumes 16-bit audio (2 bytes per sample)
+    audio_chunk = np.frombuffer(chunk.data, dtype=np.int16)
+    audio_energy = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
 
     if audio_energy < SILENCE_THRESHOLD:
         # Audio is considered silent
@@ -176,8 +223,7 @@ async def process_audio():
 
     input_audio_el = cl.Audio(content=audio_buffer, mime="audio/wav")
 
-    whisper_input = ("audio.wav", audio_buffer, "audio/wav")
-    transcription = await speech_to_text(whisper_input)
+    transcription = await speech_to_text(audio_buffer)
 
     await cl.Message(
         author="You",
@@ -188,11 +234,11 @@ async def process_audio():
 
     answer = await generate_text_answer(transcription)
 
-    output_name, output_audio = await text_to_speech(answer, "audio/wav")
+    output_name, output_audio = await text_to_speech(answer, "audio/mp3")
 
     output_audio_el = cl.Audio(
         auto_play=True,
-        mime="audio/wav",
+        mime="audio/mp3",
         content=output_audio,
     )
 
