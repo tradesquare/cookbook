@@ -6,88 +6,88 @@ import numpy as np
 import audioop
 import json
 import requests
+import asyncio
 
+import logging
 import time
 import uuid
+
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
 
 import chainlit as cl
 
 AWS_PROFILE = os.getenv("PROFILE")
 BOTNOI_API_KEY = os.getenv("BOTNOI_API_KEY")
 
+boto3.setup_default_session(profile_name=AWS_PROFILE)
+
 session = boto3.Session(profile_name=AWS_PROFILE)
-transcribe_client = session.client('transcribe')
-s3_client = session.client('s3')
 bedrock_client = session.client('bedrock-runtime')
 
-# S3 bucket for temporary audio files
-S3_BUCKET = os.getenv("S3_BUCKET", "poc-chainlit-cookbook-transcribe")
+# Get AWS region from session
+aws_region = session.region_name or 'us-east-1'
 
 if not AWS_PROFILE or not BOTNOI_API_KEY:
     raise ValueError(
         "PROFILE and BOTNOI_API_KEY must be set"
     )
 
+class TranscribeEventHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream):
+        super().__init__(output_stream)
+        self.transcript_text = ""
+        
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        results = transcript_event.transcript.results
+        for result in results:
+            if not result.is_partial:
+                for alt in result.alternatives:
+                    self.transcript_text += alt.transcript + " "
+
 
 # Define a threshold for detecting silence and a timeout for ending a turn
 SILENCE_THRESHOLD = (
     3500  # Adjust based on your audio level (e.g., lower for quieter audio)
 )
-SILENCE_TIMEOUT = 1300.0  # Seconds of silence to consider the turn finished
+SILENCE_TIMEOUT = 2000.0  # Milliseconds of silence to consider the turn finished
 
 @cl.step(type="tool")
 async def speech_to_text(audio_buffer):
-    # Generate unique job name
-    job_name = f"transcribe-job-{uuid.uuid4()}"
-    s3_key = f"audio/{job_name}.wav"
+    #
+    # Set up streaming client
+    client = TranscribeStreamingClient(region=aws_region)
     
-    try:
-        # Upload audio to S3
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=audio_buffer,
-            ContentType='audio/wav'
-        )
-        
-        # Start transcription job
-        transcribe_client.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={'MediaFileUri': f's3://{S3_BUCKET}/{s3_key}'},
-            MediaFormat='wav',
-            #LanguageCode='th, en-US'
-            IdentifyMultipleLanguages=True,
-            LanguageOptions=['th-TH', 'en-US'],
-        )
-        
-        # Wait for transcription to complete
-        while True:
-            response = transcribe_client.get_transcription_job(
-                TranscriptionJobName=job_name
-            )
-            status = response['TranscriptionJob']['TranscriptionJobStatus']
-            
-            if status == 'COMPLETED':
-                # Get transcript
-                transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
-                import urllib.request
-                with urllib.request.urlopen(transcript_uri) as response:
-                    transcript_data = json.loads(response.read())
-                    transcript_text = transcript_data['results']['transcripts'][0]['transcript']
-                break
-            elif status == 'FAILED':
-                raise Exception("Transcription failed")
-            
-            time.sleep(1)  # Wait 1 second before checking again
-        
-        return transcript_text
-        
-    finally:
-        # Clean up S3 object
-        try:
-            s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
-        except:
-            pass
+    # Start stream transcription
+    stream = await client.start_stream_transcription(
+        #language_code="th-TH",
+        language_code="en-US",
+        #identify_multiple_languages=True,
+        #language_options=["th-TH", "en-US"],
+        media_sample_rate_hz=24000,
+        media_encoding="pcm",
+    )
+    
+    # Create event handler
+    handler = TranscribeEventHandler(stream.output_stream)
+    
+    async def send_audio():
+        # Convert WAV buffer to PCM chunks
+        wav_io = io.BytesIO(audio_buffer)
+        with wave.open(wav_io, 'rb') as wav_file:
+            chunk_size = 1024 * 2  # 2KB chunks
+            while True:
+                chunk = wav_file.readframes(chunk_size)
+                if not chunk:
+                    break
+                await stream.input_stream.send_audio_event(audio_chunk=chunk)
+        await stream.input_stream.end_stream()
+    
+    # Process audio and handle events concurrently
+    await asyncio.gather(send_audio(), handler.handle_events())
+    
+    return handler.transcript_text.strip()
 
 
 @cl.step(type="tool")
@@ -138,14 +138,16 @@ async def generate_text_answer(transcription):
     # Prepare request for Claude
     body = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
+        "max_tokens": 1500,
         "temperature": 0.2,
         "messages": claude_messages
     }
     
     # Call Bedrock
     response = bedrock_client.invoke_model(
-        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        #modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        #modelId="anthropic.claude-3-7-sonnet-20250219-v1:0",
+        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
         body=json.dumps(body)
     )
     
@@ -170,8 +172,8 @@ async def start():
 @cl.on_audio_start
 async def on_audio_start():
     cl.user_session.set("silent_duration_ms", 0)
-    cl.user_session.set("is_speaking", False)
-    cl.user_session.set("audio_chunks", [])
+    cl.user_session.set("is_speaking", False) # Initialize speaking state
+    cl.user_session.set("audio_chunks", []) # Initialize audio chunks Comment= None or []?
     return True
 
 
@@ -179,6 +181,7 @@ async def on_audio_start():
 async def on_audio_chunk(chunk: cl.InputAudioChunk):
     audio_chunks = cl.user_session.get("audio_chunks")
 
+    # Initialize audio_chunks if it doesn't exist
     if audio_chunks is not None:
         audio_chunk = np.frombuffer(chunk.data, dtype=np.int16)
         audio_chunks.append(audio_chunk)
@@ -189,7 +192,7 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
         cl.user_session.set("is_speaking", True)
         return
 
-    audio_chunks = cl.user_session.get("audio_chunks")
+    #audio_chunks = cl.user_session.get("audio_chunks")
     last_elapsed_time = cl.user_session.get("last_elapsed_time")
     silent_duration_ms = cl.user_session.get("silent_duration_ms")
     is_speaking = cl.user_session.get("is_speaking")
@@ -219,6 +222,14 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
 async def process_audio():
     # Get the audio buffer from the session
     if audio_chunks := cl.user_session.get("audio_chunks"):
+        
+        #logging of the list of audio chunks for debugging using logging
+        logging.info(f"Audio chunks received------------------: {len(audio_chunks)}")
+        logging.info(f"Audio chunks received------------------: {len(audio_chunks)}")
+        logging.info(f"Audio chunks received------------------: {len(audio_chunks)}")
+        logging.info(f"Audio chunks received------------------: {len(audio_chunks)}")
+        logging.info(f"Audio chunks received------------------: {len(audio_chunks)}")
+    
         # Concatenate all chunks
         concatenated = np.concatenate(list(audio_chunks))
 
@@ -235,13 +246,14 @@ async def process_audio():
         # Reset buffer position
         wav_buffer.seek(0)
 
+        # Open the WAV file to check its properties
         cl.user_session.set("audio_chunks", [])
 
     frames = wav_file.getnframes()
     rate = wav_file.getframerate()
 
     duration = frames / float(rate)
-    if duration <= 1.71:
+    if duration <= 0.5:
         print("The audio is too short, please try again.")
         return
 
