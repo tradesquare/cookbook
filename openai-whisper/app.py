@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # AWS configuration
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_PROFILE = os.getenv("AWS_PROFILE", "tssb")
+AWS_PROFILE = os.getenv("AWS_PROFILE", "")
 
 # Knowledge Base Configuration
 KNOWLEDGE_BASE_ENABLED = os.getenv("KNOWLEDGE_BASE_ENABLED", "false").lower() == "true"
@@ -28,24 +28,27 @@ KNOWLEDGE_BASE_MODEL_ARN = os.getenv("KNOWLEDGE_BASE_MODEL_ARN", "arn:aws:bedroc
 # Initialize AWS clients
 try:
     if AWS_PROFILE:
-        session_client = boto3.session.Session(profile_name=AWS_PROFILE)
+        session = boto3.Session(profile_name=AWS_PROFILE)
         logger.info(f"Using AWS profile: {AWS_PROFILE}")
+        transcribe_client = session.client('transcribe', region_name=AWS_REGION)
+        bedrock_client = session.client('bedrock-runtime', region_name=AWS_REGION)
+        bedrock_agent_client = session.client('bedrock-agent-runtime', region_name=AWS_REGION) if KNOWLEDGE_BASE_ENABLED else None
+        s3_client = session.client('s3', region_name=AWS_REGION)
+        polly_client = session.client('polly', region_name=AWS_REGION)
     else:
-        session_client = boto3.session.Session()
         logger.info("Using default AWS session (IAM roles/environment variables)")
-    
-    transcribe_client = session_client.client('transcribe', region_name=AWS_REGION)
-    bedrock_client = session_client.client('bedrock-runtime', region_name=AWS_REGION)
-    bedrock_agent_client = session_client.client('bedrock-agent-runtime', region_name=AWS_REGION) if KNOWLEDGE_BASE_ENABLED else None
-    s3_client = session_client.client('s3', region_name=AWS_REGION)
-    polly_client = session_client.client('polly', region_name=AWS_REGION)
+        transcribe_client = boto3.client('transcribe', region_name=AWS_REGION)
+        bedrock_client = boto3.client('bedrock-runtime', region_name=AWS_REGION)
+        bedrock_agent_client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION) if KNOWLEDGE_BASE_ENABLED else None
+        s3_client = boto3.client('s3', region_name=AWS_REGION)
+        polly_client = boto3.client('polly', region_name=AWS_REGION)
     logger.info(f"AWS clients initialized successfully for region: {AWS_REGION}")
 except Exception as e:
     logger.error(f"Failed to initialize AWS clients: {e}")
     raise
 
 # S3 bucket for temporary audio files
-S3_BUCKET = os.getenv("S3_BUCKET", "test-local-buket")
+S3_BUCKET = os.getenv("S3_BUCKET", "chainlit-voice-chat-audio-dev-654654383273")
 
 def test_s3_connectivity():
     """Test S3 connectivity and bucket access"""
@@ -142,15 +145,36 @@ async def speech_to_text(audio_buffer):
         )
         logger.info("Audio uploaded successfully to S3")
         
+        # Verify the upload by checking if the object exists
+        # This helps debug permission issues early
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+            logger.info("Verified: uploaded audio file is accessible in S3")
+        except Exception as verify_error:
+            logger.error(f"Failed to verify uploaded file: {verify_error}")
+            raise Exception(f"S3 upload verification failed: {verify_error}")
+        
         # Step 2: Start transcription job
         # Transcribe jobs are asynchronous - we start them and poll for results
         logger.info(f"Starting transcription job: {job_name}")
-        transcribe_client.start_transcription_job(
-            TranscriptionJobName=job_name,  # Must be unique across account
-            Media={'MediaFileUri': f's3://{S3_BUCKET}/{s3_key}'},  # S3 URI format required
-            MediaFormat='wav',  # Tell Transcribe what audio format to expect
-            LanguageCode='en-US'  # Language model to use for transcription
-        )
+        s3_uri = f's3://{S3_BUCKET}/{s3_key}'
+        logger.info(f"Using S3 URI for Transcribe: {s3_uri}")
+        
+        try:
+            transcribe_client.start_transcription_job(
+                TranscriptionJobName=job_name,  # Must be unique across account
+                Media={'MediaFileUri': s3_uri},  # S3 URI format required
+                MediaFormat='wav',  # Tell Transcribe what audio format to expect
+                LanguageCode='en-US'  # Language model to use for transcription
+            )
+            logger.info("Transcription job started successfully")
+        except Exception as transcribe_error:
+            logger.error(f"Failed to start transcription job: {transcribe_error}")
+            # Add specific error details for common permission issues
+            if "AccessDenied" in str(transcribe_error) or "BadRequest" in str(transcribe_error):
+                logger.error("This likely indicates a permission issue with S3 access")
+                logger.error("Ensure the ECS task role has s3:GetObject permission on the audio bucket")
+            raise
         
         # Step 3: Poll for job completion
         # Transcription takes time (usually 10-30 seconds for short audio)
@@ -183,13 +207,20 @@ async def speech_to_text(audio_buffer):
         # Extract the actual transcribed text from nested JSON structure
         # Structure: results -> transcripts -> [0] -> transcript
         transcription = transcript_data['results']['transcripts'][0]['transcript']
-        logger.info("Transcription completed successfully")
+        
+        # Validate transcription is not empty
+        # AWS Transcribe can return empty strings for silence or unclear audio
+        if not transcription or not transcription.strip():
+            logger.warning("Transcription resulted in empty text")
+            raise Exception("No speech detected in audio. Please try speaking more clearly or loudly.")
+        
+        logger.info(f"Transcription completed successfully: '{transcription[:50]}...'")
         
         # Step 6: Clean up temporary S3 object to avoid storage costs
         s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
         logger.info("Cleaned up S3 object")
         
-        return transcription
+        return transcription.strip()  # Return cleaned transcription
         
     except Exception as e:
         logger.error(f"Speech to text failed: {e}")
@@ -276,31 +307,54 @@ async def generate_text_answer(transcription):
     """Generate AI response using Claude via AWS Bedrock
     
     Process:
-    1. Get conversation history from session
-    2. Add user's message to history
-    3. Format messages for Claude API
-    4. Call Bedrock with Claude model
-    5. Parse response and update history
-    6. Return AI's response text
+    1. Validate input transcription
+    2. Get conversation history from session
+    3. Add user's message to history
+    4. Format messages for Claude API
+    5. Call Bedrock with Claude model
+    6. Parse response and update history
+    7. Return AI's response text
     """
-    # Step 1: Retrieve conversation history
+    # Step 1: Validate input
+    if not transcription or not transcription.strip():
+        logger.error("Empty transcription provided to generate_text_answer")
+        raise ValueError("Cannot generate response for empty transcription")
+    
+    transcription = transcription.strip()  # Clean whitespace
+    
+    # Step 2: Retrieve and clean conversation history
     message_history = cl.user_session.get("message_history", [])
     
-    # Step 2: Query knowledge base if enabled
+    # Step 3: Query knowledge base if enabled
     kb_context = await query_knowledge_base(transcription)
     
-    # Step 3: Add user's transcribed message to conversation
+    # Step 4: Add user's transcribed message to conversation
     message_history.append({"role": "user", "content": transcription})
     
-    # Step 4: Convert internal format to Claude API format
+    # Step 5: Clean conversation history to ensure proper role alternation
+    # This prevents consecutive messages with the same role
+    cleaned_history = clean_conversation_history(message_history)
+    
+    # Step 6: Convert cleaned history to Claude API format
     claude_messages = []
-    for msg in message_history:
+    for msg in cleaned_history:
         if msg["role"] == "user":
             claude_messages.append({"role": "user", "content": msg["content"]})
         elif msg["role"] == "assistant":
             claude_messages.append({"role": "assistant", "content": msg["content"]})
     
-    # Step 5: Prepare request body with optional knowledge base context
+    # Ensure we have at least one message for Claude
+    if not claude_messages:
+        logger.error("No valid messages to send to Claude after cleaning")
+        # Fallback: create a single user message
+        claude_messages = [{"role": "user", "content": transcription}]
+    
+    # Ensure the conversation starts with a user message (Claude requirement)
+    if claude_messages[0]["role"] != "user":
+        logger.info("Ensuring conversation starts with user message")
+        claude_messages.insert(0, {"role": "user", "content": transcription})
+    
+    # Step 7: Prepare request body with optional knowledge base context
     system_prompt = "You are a helpful AI assistant. Provide clear, concise, and helpful responses."
     if kb_context:
         system_prompt += f"\n\nRelevant context from knowledge base:\n{kb_context}"
@@ -314,14 +368,28 @@ async def generate_text_answer(transcription):
     }
     
     try:
-        # Step 6: Call Claude via AWS Bedrock
+        # Step 8: Call Claude via AWS Bedrock
         # Bedrock provides managed access to foundation models like Claude
+        logger.info(f"Sending {len(claude_messages)} messages to Claude")
+        
+        # Debug: Log role sequence to verify alternation
+        roles = [msg["role"] for msg in claude_messages]
+        logger.info(f"Message role sequence: {' -> '.join(roles)}")
+        
+        # Verify role alternation before sending (final safety check)
+        for i in range(1, len(claude_messages)):
+            if claude_messages[i]["role"] == claude_messages[i-1]["role"]:
+                logger.error(f"Role alternation violation detected at position {i}")
+                raise ValueError(f"Invalid role sequence: {roles}")
+        
+        logger.debug(f"Claude messages: {claude_messages}")
+        
         response = bedrock_client.invoke_model(
             modelId="anthropic.claude-3-sonnet-20240229-v1:0",  # Specific Claude model version
             body=json.dumps(body)  # Request must be JSON string
         )
         
-        # Step 7: Parse Bedrock response
+        # Step 9: Parse Bedrock response
         # Bedrock wraps the model response in its own format
         response_body = json.loads(response['body'].read())
         
@@ -329,15 +397,59 @@ async def generate_text_answer(transcription):
         # Structure: content -> [0] -> text
         assistant_message = response_body['content'][0]['text']
         
-        # Step 8: Add AI response to conversation history
-        # This maintains context for future turns in the conversation
-        message_history.append({"role": "assistant", "content": assistant_message})
+        # Validate response is not empty
+        if not assistant_message or not assistant_message.strip():
+            logger.error("Claude returned empty response")
+            assistant_message = "I apologize, but I couldn't generate a proper response. Please try again."
         
-        return assistant_message
+        # Step 10: Add AI response to conversation history
+        # This maintains context for future turns in the conversation
+        message_history.append({"role": "assistant", "content": assistant_message.strip()})
+        
+        # Clean and update session with properly alternating message history
+        cleaned_message_history = clean_conversation_history(message_history)
+        cl.user_session.set("message_history", cleaned_message_history)
+        
+        return assistant_message.strip()
         
     except Exception as e:
-        # Common failures: model limits, malformed request, API errors
-        logger.error(f"Generate text answer failed: {e}")
+        # Common failures: model limits, malformed request, API errors, role alternation issues
+        error_msg = str(e)
+        logger.error(f"Generate text answer failed: {error_msg}")
+        
+        # Handle specific validation errors
+        if "roles must alternate" in error_msg:
+            logger.error("Role alternation error - clearing conversation history")
+            # Reset conversation history and try with just the current message
+            cl.user_session.set("message_history", [])
+            simplified_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1000,
+                "temperature": 0.2,
+                "system": "You are a helpful AI assistant. Provide clear, concise, and helpful responses.",
+                "messages": [{"role": "user", "content": transcription}]
+            }
+            try:
+                logger.info("Retrying with simplified message history")
+                response = bedrock_client.invoke_model(
+                    modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                    body=json.dumps(simplified_body)
+                )
+                response_body = json.loads(response['body'].read())
+                assistant_message = response_body['content'][0]['text']
+                
+                # Start fresh conversation history
+                new_history = [
+                    {"role": "user", "content": transcription},
+                    {"role": "assistant", "content": assistant_message.strip()}
+                ]
+                cl.user_session.set("message_history", new_history)
+                
+                return assistant_message.strip()
+            except Exception as retry_error:
+                logger.error(f"Retry also failed: {retry_error}")
+                return "I apologize, but I'm having trouble processing your request. Please try again."
+        
         raise
 
 
@@ -499,33 +611,90 @@ async def process_audio():
         input_audio_el = cl.Audio(content=audio_buffer, mime="audio/wav")
 
         # Step 6: Process complete voice interaction pipeline
-        
-        # Convert speech to text using AWS Transcribe
-        transcription = await speech_to_text(audio_buffer)
-        
-        # Display user's message with transcription and playable audio
-        await cl.Message(
-            author="You",                    # Show as user's message
-            type="user_message",            # Message type for styling
-            content=transcription,          # Display transcribed text
-            elements=[input_audio_el],      # Include audio playback
-        ).send()
+        try:
+            # Convert speech to text using AWS Transcribe
+            transcription = await speech_to_text(audio_buffer)
+            
+            # Display user's message with transcription and playable audio
+            await cl.Message(
+                author="You",                    # Show as user's message
+                type="user_message",            # Message type for styling
+                content=transcription,          # Display transcribed text
+                elements=[input_audio_el],      # Include audio playback
+            ).send()
 
-        # Generate AI response from transcribed text
-        answer = await generate_text_answer(transcription)
+            # Generate AI response from transcribed text
+            answer = await generate_text_answer(transcription)
+            
+            # Convert AI response to speech audio
+            output_name, output_audio = await text_to_speech(answer)
+
+            # Create audio element for AI response
+            output_audio_el = cl.Audio(
+                auto_play=True,        # Automatically play when message appears
+                mime="audio/mp3",      # MP3 format from Polly
+                content=output_audio,  # Audio bytes
+            )
+
+            # Display AI response with text and auto-playing audio
+            await cl.Message(content=answer, elements=[output_audio_el]).send()
+            
+        except Exception as e:
+            logger.error(f"Voice processing pipeline failed: {e}")
+            
+            # Show user-friendly error message
+            error_message = "Sorry, I couldn't process your voice input. "
+            
+            if "No speech detected" in str(e):
+                error_message += "Please try speaking more clearly or loudly."
+            elif "Empty transcription" in str(e) or "ValidationException" in str(e):
+                error_message += "I didn't detect any speech. Please try again."
+            elif "BadRequest" in str(e) or "AccessDenied" in str(e):
+                error_message += "There was a technical issue. Please try again later."
+            else:
+                error_message += "Please try again."
+            
+            # Display error with the original audio for debugging
+            await cl.Message(
+                content=error_message,
+                elements=[input_audio_el],  # Include audio so user can verify what was recorded
+            ).send()
+
+
+def clean_conversation_history(message_history):
+    """Clean conversation history to ensure proper role alternation
+    
+    Claude requires strict alternation between user and assistant roles.
+    This function removes consecutive messages with the same role.
+    
+    Args:
+        message_history: List of message dictionaries with 'role' and 'content'
+    
+    Returns:
+        List of cleaned messages with proper alternation
+    """
+    if not message_history:
+        return []
+    
+    cleaned_history = []
+    last_role = None
+    
+    for msg in message_history:
+        content = msg["content"].strip() if msg["content"] else ""
+        if not content:
+            continue  # Skip empty messages
+            
+        current_role = msg["role"]
         
-        # Convert AI response to speech audio
-        output_name, output_audio = await text_to_speech(answer)
-
-        # Create audio element for AI response
-        output_audio_el = cl.Audio(
-            auto_play=True,        # Automatically play when message appears
-            mime="audio/mp3",      # MP3 format from Polly
-            content=output_audio,  # Audio bytes
-        )
-
-        # Display AI response with text and auto-playing audio
-        await cl.Message(content=answer, elements=[output_audio_el]).send()
+        # Only add if role is different from previous or if it's the first message
+        if current_role != last_role:
+            cleaned_history.append({"role": current_role, "content": content})
+            last_role = current_role
+        else:
+            # Replace the last message of the same role (keep the most recent)
+            cleaned_history[-1] = {"role": current_role, "content": content}
+    
+    return cleaned_history
 
 
 @cl.on_message

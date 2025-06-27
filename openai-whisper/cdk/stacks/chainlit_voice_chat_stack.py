@@ -142,17 +142,32 @@ class ChainlitVoiceChatStack(Stack):
         )
         
         # S3 permissions for audio file operations
-        # Allows uploading user audio and deleting processed files
+        # Allows uploading user audio, reading files for Transcribe, and deleting processed files
         role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,  # Grant permission (vs DENY)
                 actions=[
                     "s3:PutObject",    # Upload audio files (e.g., user_audio_123.wav)
+                    "s3:GetObject",    # Read audio files (required for Transcribe to access S3 URIs)
                     "s3:DeleteObject"  # Delete processed files to save storage
                 ],
                 # Only allow access to objects in our specific bucket
                 # Example: arn:aws:s3:::chainlit-voice-chat-audio-dev-123456789012/*
                 resources=[f"{self.audio_bucket.bucket_arn}/*"]
+            )
+        )
+        
+        # Additional S3 bucket-level permissions
+        # Required for certain S3 operations and service integrations
+        role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "s3:ListBucket",        # List bucket contents (useful for debugging)
+                    "s3:GetBucketLocation"  # Get bucket region (some AWS services require this)
+                ],
+                # Bucket-level permissions (no /* suffix)
+                resources=[self.audio_bucket.bucket_arn]
             )
         )
         
@@ -163,7 +178,8 @@ class ChainlitVoiceChatStack(Stack):
                 effect=iam.Effect.ALLOW,
                 actions=[
                     "transcribe:StartTranscriptionJob",  # Start async transcription job
-                    "transcribe:GetTranscriptionJob"     # Check job status and get results
+                    "transcribe:GetTranscriptionJob",    # Check job status and get results
+                    "transcribe:DeleteTranscriptionJob"  # Clean up completed jobs (optional)
                 ],
                 resources=["*"]  # Transcribe jobs don't have specific ARNs
             )
