@@ -7,6 +7,7 @@ from aws_cdk import (
     aws_s3 as s3,  # Simple Storage Service for file storage
     aws_logs as logs,  # CloudWatch Logs for application logging
     aws_elasticloadbalancingv2 as elbv2,  # Application Load Balancer
+    aws_certificatemanager as acm,  # For SSL/TLS certificates
     aws_secretsmanager as secretsmanager,  # For storing sensitive data (imported but not used)
     RemovalPolicy,  # Defines what happens to resources when stack is deleted
     Duration,  # Helper for time-based configurations
@@ -26,13 +27,14 @@ class ChainlitVoiceChatStack(Stack):
     - IAM roles with permissions for AWS services (Transcribe, Bedrock, Polly)
     """
     
-    def __init__(self, scope: Construct, construct_id: str, env_name: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, env_name: str, certificate_arn: str = None, **kwargs) -> None:
         """Initialize the stack with required AWS resources
         
         Args:
             scope: The parent construct (usually the CDK app)
             construct_id: Unique identifier for this stack (e.g., 'ChainlitVoiceChatStack')
             env_name: Environment name for resource naming (e.g., 'dev', 'prod')
+            certificate_arn: ARN of existing ACM certificate for HTTPS
             **kwargs: Additional CDK stack arguments (region, account, etc.)
         """
         super().__init__(scope, construct_id, **kwargs)
@@ -40,6 +42,7 @@ class ChainlitVoiceChatStack(Stack):
         # Store environment name for resource naming consistency
         # Example: if env_name='dev', resources will be named like 'chainlit-voice-chat-dev'
         self.env_name = env_name
+        self.certificate_arn = certificate_arn
         
         # Create VPC first as other resources depend on it
         # VPC provides isolated network environment for all resources
@@ -400,14 +403,29 @@ class ChainlitVoiceChatStack(Stack):
         # This connects the load balancer to the running containers
         self.service.attach_to_application_target_group(target_group)
         
-        # Create listener to handle incoming requests
-        # Listener defines what port ALB listens on and where to route traffic
-        alb.add_listener(
-            "Listener",  # Construct ID
-            port=80,  # Listen on HTTP port 80
-            protocol=elbv2.ApplicationProtocol.HTTP,  # HTTP protocol
-            default_target_groups=[target_group]  # Route traffic to our target group
-        )
+        # Add HTTPS listener if certificate is provided (keep existing HTTP listener)
+        if self.certificate_arn:
+            certificate = acm.Certificate.from_certificate_arn(
+                self, "Certificate",
+                certificate_arn=self.certificate_arn
+            )
+            
+            alb.add_listener(
+                "HttpsListener",
+                port=443,
+                protocol=elbv2.ApplicationProtocol.HTTPS,
+                certificates=[certificate],
+                default_target_groups=[target_group]
+            )
+        
+        # Only create HTTP listener if it doesn't exist (for new deployments)
+        if not self.certificate_arn:
+            alb.add_listener(
+                "Listener",
+                port=80,
+                protocol=elbv2.ApplicationProtocol.HTTP,
+                default_target_groups=[target_group]
+            )
         
         # Allow ALB to communicate with ECS service
         # (This comment indicates missing security group rule - should be implemented)
@@ -435,6 +453,6 @@ class ChainlitVoiceChatStack(Stack):
         
         CfnOutput(
             self, "ApplicationURL",
-            value=f"http://{self.alb.load_balancer_dns_name}",
+            value=f"{'https' if self.certificate_arn else 'http'}://{self.alb.load_balancer_dns_name}",
             description="URL to access the Chainlit application"
         )
