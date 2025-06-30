@@ -48,10 +48,18 @@ class TranscribeEventHandler(TranscriptResultStreamHandler):
 
 
 # Define a threshold for detecting silence and a timeout for ending a turn
-SILENCE_THRESHOLD = (
-    500  # Adjust based on your audio level (e.g., lower for quieter audio)
-)
-SILENCE_TIMEOUT = 3000.0  # Milliseconds of silence to consider the turn finished
+# Lowered threshold for better sensitivity with Thai speech
+SILENCE_THRESHOLD = 1500  # Lowered from 3500 for better Thai speech detection
+SILENCE_TIMEOUT = 3000.0  # Increased from 2000ms to 3000ms for Thai speech patterns
+
+# Language-specific settings
+THAI_SILENCE_THRESHOLD = 1200  # Even lower threshold for Thai
+THAI_SILENCE_TIMEOUT = 3500.0  # Longer timeout for Thai speech patterns
+ENGLISH_SILENCE_THRESHOLD = 2000
+ENGLISH_SILENCE_TIMEOUT = 2500.0
+
+# Manual language override for testing - set this to force a specific language
+FORCE_LANGUAGE = "thai"  # Set to "thai" or "english" to override detection, or None for auto-detection
 
 @cl.step(type="tool")
 async def speech_to_text(audio_buffer):
@@ -173,7 +181,9 @@ async def start():
 async def on_audio_start():
     cl.user_session.set("silent_duration_ms", 0)
     cl.user_session.set("is_speaking", False) # Initialize speaking state
-    cl.user_session.set("audio_chunks", []) # Initialize audio chunks Comment= None or []?
+    cl.user_session.set("audio_chunks", []) # Initialize audio chunks
+    cl.user_session.set("energy_history", []) # Initialize energy history for moving average
+    cl.user_session.set("speech_start_time", 0) # Initialize speech start time
     return True
 
 
@@ -190,12 +200,13 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
     if chunk.isStart:
         cl.user_session.set("last_elapsed_time", chunk.elapsedTime)
         cl.user_session.set("is_speaking", True)
+        cl.user_session.set("speech_start_time", chunk.elapsedTime)
         return
 
-    #audio_chunks = cl.user_session.get("audio_chunks")
     last_elapsed_time = cl.user_session.get("last_elapsed_time")
     silent_duration_ms = cl.user_session.get("silent_duration_ms")
     is_speaking = cl.user_session.get("is_speaking")
+    speech_start_time = cl.user_session.get("speech_start_time", chunk.elapsedTime)
 
     # Calculate the time difference between this chunk and the previous one
     time_diff_ms = chunk.elapsedTime - last_elapsed_time
@@ -205,11 +216,49 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
     audio_chunk = np.frombuffer(chunk.data, dtype=np.int16)
     audio_energy = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
 
-    if audio_energy < SILENCE_THRESHOLD:
+    # Detect language and get appropriate parameters
+    detected_language = detect_language_from_audio_energy(audio_chunks)
+    silence_threshold, silence_timeout = get_silence_parameters(detected_language)
+    
+    # Debug logging every 50 chunks to avoid spam
+    chunk_count = cl.user_session.get("chunk_count", 0)
+    chunk_count += 1
+    cl.user_session.set("chunk_count", chunk_count)
+    
+    if chunk_count % 50 == 0:
+        logging.info(f"Language: {detected_language}, Energy: {audio_energy:.2f}, "
+                    f"Threshold: {silence_threshold}, Timeout: {silence_timeout}ms")
+    
+    # Minimum speech duration before allowing cutoff (prevent very short clips)
+    min_speech_duration = 1500  # 1.5 seconds minimum
+    total_speech_duration = chunk.elapsedTime - speech_start_time
+
+    # Enhanced silence detection with multiple criteria
+    is_silent = audio_energy < silence_threshold
+    
+    # Additional check: use a moving average for more stable detection
+    if not hasattr(cl.user_session, 'energy_history'):
+        cl.user_session.set("energy_history", [])
+    
+    energy_history = cl.user_session.get("energy_history")
+    energy_history.append(audio_energy)
+    
+    # Keep only last 5 readings for moving average
+    if len(energy_history) > 5:
+        energy_history.pop(0)
+    
+    avg_energy = np.mean(energy_history)
+    is_consistently_silent = avg_energy < silence_threshold
+
+    if is_consistently_silent:
         # Audio is considered silent
         silent_duration_ms += time_diff_ms
         cl.user_session.set("silent_duration_ms", silent_duration_ms)
-        if silent_duration_ms >= SILENCE_TIMEOUT and is_speaking:
+        
+        # Only process if we have minimum speech duration AND silence timeout
+        if (silent_duration_ms >= silence_timeout and 
+            is_speaking and 
+            total_speech_duration >= min_speech_duration):
             cl.user_session.set("is_speaking", False)
             await process_audio()
     else:
@@ -217,6 +266,7 @@ async def on_audio_chunk(chunk: cl.InputAudioChunk):
         cl.user_session.set("silent_duration_ms", 0)
         if not is_speaking:
             cl.user_session.set("is_speaking", True)
+            cl.user_session.set("speech_start_time", chunk.elapsedTime)
 
 
 async def process_audio():
@@ -288,5 +338,51 @@ async def process_audio():
 @cl.on_message
 async def on_message(message: cl.Message):
     await cl.Message(content="This is a voice demo, press P to start!").send()
+
+def detect_language_from_audio_energy(audio_chunks, recent_chunks_count=10):
+    """
+    Simple heuristic to detect language based on recent audio patterns.
+    Thai speech often has different energy patterns than English.
+    """
+    if not audio_chunks or len(audio_chunks) < recent_chunks_count:
+        return "unknown"
+    
+    # Analyze recent chunks for energy variance
+    recent_chunks = audio_chunks[-recent_chunks_count:]
+    energies = []
+    
+    for chunk in recent_chunks:
+        if isinstance(chunk, np.ndarray):
+            energy = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
+            energies.append(energy)
+    
+    if not energies:
+        return "unknown"
+    
+    # Thai speech often has more varied energy patterns
+    energy_variance = np.var(energies)
+    mean_energy = np.mean(energies)
+    
+    # Heuristic: Thai speech tends to have higher variance in energy
+    if energy_variance > mean_energy * 0.3:
+        return "thai"
+    else:
+        return "english"
+
+def get_silence_parameters(detected_language="unknown"):
+    """
+    Get appropriate silence detection parameters based on detected language.
+    """
+    # Check for manual override first
+    if FORCE_LANGUAGE:
+        detected_language = FORCE_LANGUAGE
+        
+    if detected_language == "thai":
+        return THAI_SILENCE_THRESHOLD, THAI_SILENCE_TIMEOUT
+    elif detected_language == "english":
+        return ENGLISH_SILENCE_THRESHOLD, ENGLISH_SILENCE_TIMEOUT
+    else:
+        # Default to more permissive settings (Thai parameters)
+        return THAI_SILENCE_THRESHOLD, THAI_SILENCE_TIMEOUT
 
 

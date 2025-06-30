@@ -5,7 +5,6 @@ import boto3
 import numpy as np
 import audioop
 import json
-import requests
 import asyncio
 
 import logging
@@ -19,19 +18,19 @@ from amazon_transcribe.model import TranscriptEvent
 import chainlit as cl
 
 AWS_PROFILE = os.getenv("PROFILE")
-BOTNOI_API_KEY = os.getenv("BOTNOI_API_KEY")
 
 boto3.setup_default_session(profile_name=AWS_PROFILE)
 
 session = boto3.Session(profile_name=AWS_PROFILE)
 bedrock_client = session.client('bedrock-runtime')
+polly_client = session.client('polly')
 
 # Get AWS region from session
 aws_region = session.region_name or 'us-east-1'
 
-if not AWS_PROFILE or not BOTNOI_API_KEY:
+if not AWS_PROFILE:
     raise ValueError(
-        "PROFILE and BOTNOI_API_KEY must be set"
+        "PROFILE must be set"
     )
 
 class TranscribeEventHandler(TranscriptResultStreamHandler):
@@ -49,7 +48,7 @@ class TranscribeEventHandler(TranscriptResultStreamHandler):
 
 # Define a threshold for detecting silence and a timeout for ending a turn
 SILENCE_THRESHOLD = (
-    500  # Adjust based on your audio level (e.g., lower for quieter audio)
+    1000  # Adjust based on your audio level (e.g., lower for quieter audio)
 )
 SILENCE_TIMEOUT = 3000.0  # Milliseconds of silence to consider the turn finished
 
@@ -61,8 +60,8 @@ async def speech_to_text(audio_buffer):
     
     # Start stream transcription
     stream = await client.start_stream_transcription(
-        language_code="th-TH",
-        #language_code="en-US",
+        #language_code="th-TH",
+        language_code="en-US",
         #identify_multiple_languages=True,
         #language_options=["th-TH", "en-US"],
         media_sample_rate_hz=24000,
@@ -95,29 +94,59 @@ async def text_to_speech(text: str, mime_type: str):
     # Detect if text contains Thai characters
     has_thai = any('\u0e00' <= char <= '\u0e7f' for char in text)
     
-    url = "https://api-voice.botnoi.ai/openapi/v1/generate_audio"
-    payload = {
-        "text": text,
-        "speaker": "1",
-        "volume": "1",
-        "speed": 1,
-        "type_media": "mp3",
-        "save_file": "true",
-        "language": "th" if has_thai else "en",
-    }
-    headers = {
-        'Botnoi-Token': BOTNOI_API_KEY,
-        'Content-Type': 'application/json'
-    }
+    # # Choose voice based on language
+    # # Note: AWS Polly doesn't have Thai voices, so we use the best alternatives
+    # if has_thai:
+    #     # For Thai text, we'll use a neural voice that might handle it better
+    #     voice_id = 'Aria'  # English neural voice that might handle some Thai
+    #     language_code = 'en-US'
+    #     # Alternatively, you could use SSML to improve pronunciation
+    #     text_input = f'<speak><lang xml:lang="th-TH">{text}</lang></speak>'
+    #     text_type = 'ssml'
+    # else:
+    #     voice_id = 'Joanna'  # English voice
+    #     language_code = 'en-US'
+    #     text_input = text
+    #     text_type = 'text'
     
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
-    
-    #get audio url in response
-    # get audio_url in response.content
-    audio_url = json.loads(response.content.decode('utf-8'))['audio_url']
-    
-    return "output_audio.mp3", response.content, audio_url
+    voice_id = 'Joanna'  # Default voice
+    language_code = 'en-US'
+    text_input = text
+    text_type = 'text'
+    try:
+        # Use AWS Polly to synthesize speech
+        response = polly_client.synthesize_speech(
+            Text=text_input,
+            TextType=text_type,
+            OutputFormat='mp3',
+            VoiceId=voice_id,
+            LanguageCode=language_code,
+            Engine='neural'  # Use neural engine for better quality
+        )
+        
+        # Get the audio stream
+        audio_content = response['AudioStream'].read()
+        
+        # For AWS Polly, we don't have a URL, so we'll return the content directly
+        return "output_audio.mp3", audio_content, None
+        
+    except Exception as e:
+        print(f"Error with AWS Polly: {e}")
+        # Fallback to standard engine if neural fails
+        try:
+            response = polly_client.synthesize_speech(
+                Text=text if not has_thai else text,  # Use plain text for fallback
+                TextType='text',
+                OutputFormat='mp3',
+                VoiceId='Joanna',
+                LanguageCode='en-US',
+                Engine='standard'
+            )
+            audio_content = response['AudioStream'].read()
+            return "output_audio.mp3", audio_content, None
+        except Exception as e2:
+            print(f"Fallback also failed: {e2}")
+            return "output_audio.mp3", b"", None
 
 
 @cl.step(type="tool")
@@ -275,11 +304,9 @@ async def process_audio():
     output_name, output_audio, audio_url = await text_to_speech(answer, "audio/mp3")
 
     output_audio_el = cl.Audio(
-        #get url from botnoi api response
-        url=audio_url,
+        content=output_audio,
         auto_play=True,
         mime="audio/mp3",
-        content=output_audio,
     )
 
     await cl.Message(content=answer, elements=[output_audio_el]).send()
