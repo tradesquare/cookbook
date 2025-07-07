@@ -18,23 +18,21 @@ from amazon_transcribe.model import TranscriptEvent
 
 import chainlit as cl
 
-# Use environment variables set by CDK stack
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET")
-
-# Optional: Keep Botnoi API if needed, otherwise will use Amazon Polly
+AWS_PROFILE = os.getenv("PROFILE")
 BOTNOI_API_KEY = os.getenv("BOTNOI_API_KEY")
 
-# Health check will be handled by Chainlit main endpoint
+boto3.setup_default_session(profile_name=AWS_PROFILE)
 
-# Initialize AWS clients without profile (use IAM role in ECS)
-try:
-    bedrock_client = boto3.client('bedrock-runtime', region_name=AWS_REGION)
-    polly_client = boto3.client('polly', region_name=AWS_REGION)
-    s3_client = boto3.client('s3', region_name=AWS_REGION)
-except Exception as e:
-    logging.error(f"Failed to initialize AWS clients: {e}")
-    raise
+session = boto3.Session(profile_name=AWS_PROFILE)
+bedrock_client = session.client('bedrock-runtime')
+
+# Get AWS region from session
+aws_region = session.region_name or 'us-east-1'
+
+if not AWS_PROFILE or not BOTNOI_API_KEY:
+    raise ValueError(
+        "PROFILE and BOTNOI_API_KEY must be set"
+    )
 
 class TranscribeEventHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream):
@@ -57,8 +55,9 @@ SILENCE_TIMEOUT = 3000.0  # Milliseconds of silence to consider the turn finishe
 
 @cl.step(type="tool")
 async def speech_to_text(audio_buffer):
+    #
     # Set up streaming client
-    client = TranscribeStreamingClient(region=AWS_REGION)
+    client = TranscribeStreamingClient(region=aws_region)
     
     # Start stream transcription
     stream = await client.start_stream_transcription(
@@ -96,75 +95,29 @@ async def text_to_speech(text: str, mime_type: str):
     # Detect if text contains Thai characters
     has_thai = any('\u0e00' <= char <= '\u0e7f' for char in text)
     
-    # Try using Botnoi API first if available, otherwise use Amazon Polly
-    if BOTNOI_API_KEY:
-        try:
-            url = "https://api-voice.botnoi.ai/openapi/v1/generate_audio"
-            payload = {
-                "text": text,
-                "speaker": "1",
-                "volume": "1",
-                "speed": 1,
-                "type_media": "mp3",
-                "save_file": "true",
-                "language": "th" if has_thai else "en",
-            }
-            headers = {
-                'Botnoi-Token': BOTNOI_API_KEY,
-                'Content-Type': 'application/json'
-            }
-            
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            # Get audio url in response
-            audio_url = json.loads(response.content.decode('utf-8'))['audio_url']
-            return "output_audio.mp3", response.content, audio_url
-            
-        except Exception as e:
-            logging.warning(f"Botnoi API failed, falling back to Amazon Polly: {e}")
+    url = "https://api-voice.botnoi.ai/openapi/v1/generate_audio"
+    payload = {
+        "text": text,
+        "speaker": "1",
+        "volume": "1",
+        "speed": 1,
+        "type_media": "mp3",
+        "save_file": "true",
+        "language": "th" if has_thai else "en",
+    }
+    headers = {
+        'Botnoi-Token': BOTNOI_API_KEY,
+        'Content-Type': 'application/json'
+    }
     
-    # Use Amazon Polly as fallback or primary TTS
-    try:
-        # Determine voice based on language
-        voice_id = "Takumi" if has_thai else "Joanna"  # Use appropriate voices
-        
-        response = polly_client.synthesize_speech(
-            Text=text,
-            OutputFormat='mp3',
-            VoiceId=voice_id,
-            LanguageCode='th-TH' if has_thai else 'en-US'
-        )
-        
-        audio_content = response['AudioStream'].read()
-        
-        # Upload to S3 if bucket is configured
-        audio_filename = f"tts_audio_{uuid.uuid4()}.mp3"
-        if S3_BUCKET:
-            try:
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=audio_filename,
-                    Body=audio_content,
-                    ContentType='audio/mpeg'
-                )
-                # Generate presigned URL for audio playback
-                audio_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': S3_BUCKET, 'Key': audio_filename},
-                    ExpiresIn=3600  # 1 hour
-                )
-            except Exception as e:
-                logging.warning(f"Failed to upload to S3: {e}")
-                audio_url = None
-        else:
-            audio_url = None
-            
-        return audio_filename, audio_content, audio_url
-        
-    except Exception as e:
-        logging.error(f"Amazon Polly TTS failed: {e}")
-        raise
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    
+    #get audio url in response
+    # get audio_url in response.content
+    audio_url = json.loads(response.content.decode('utf-8'))['audio_url']
+    
+    return "output_audio.mp3", response.content, audio_url
 
 
 @cl.step(type="tool")
@@ -190,29 +143,40 @@ async def generate_text_answer(transcription):
         "messages": claude_messages
     }
     
-    # Call Bedrock
-    response = bedrock_client.invoke_model(
-        #modelId="anthropic.claude-3-sonnet-20240229-v1:0",
-        #modelId="anthropic.claude-3-7-sonnet-20250219-v1:0",
-        modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
-        body=json.dumps(body)
-    )
+    # Try different Claude models in order of preference
+    model_ids = [
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        # Add more fallback models if needed
+    ]
     
-    # Parse response
-    response_body = json.loads(response['body'].read())
-    assistant_message = response_body['content'][0]['text']
+    assistant_message = None
+    for model_id in model_ids:
+        try:
+            # Call Bedrock
+            response = bedrock_client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body)
+            )
+            
+            # Parse response
+            response_body = json.loads(response['body'].read())
+            assistant_message = response_body['content'][0]['text']
+            break  # Success, exit the loop
+            
+        except Exception as e:
+            logging.warning(f"Failed to use model {model_id}: {str(e)}")
+            continue  # Try next model
+    
+    if not assistant_message:
+        # If all models fail, provide a fallback response
+        assistant_message = "I'm sorry, I'm currently unable to process your request. Please try again later."
+        logging.error("All Bedrock models failed to respond")
     
     # Add assistant response to history
     message_history.append({"role": "assistant", "content": assistant_message})
     
     return assistant_message
-
-
-# Health check endpoint for ALB
-@cl.on_stop
-async def on_stop():
-    """Cleanup function when app stops"""
-    pass
 
 
 @cl.on_chat_start
@@ -277,7 +241,7 @@ async def process_audio():
     # Get the audio buffer from the session
     if audio_chunks := cl.user_session.get("audio_chunks"):
         
-        #logging of the list of audio chunks for debugging using logging
+        # Log the number of audio chunks for debugging
         logging.info(f"Audio chunks received: {len(audio_chunks)}")
     
         # Concatenate all chunks
@@ -293,23 +257,26 @@ async def process_audio():
             wav_file.setframerate(24000)  # sample rate (24kHz PCM)
             wav_file.writeframes(concatenated.tobytes())
 
-        # Reset buffer position
+        # Reset buffer position to read the WAV file
         wav_buffer.seek(0)
 
-        # Open the WAV file to check its properties
-        cl.user_session.set("audio_chunks", [])
-
-        # Check audio duration
-        with wave.open(wav_buffer, "rb") as wav_file:
-            frames = wav_file.getnframes()
-            rate = wav_file.getframerate()
+        # Check audio duration before processing
+        with wave.open(wav_buffer, 'rb') as wav_file_check:
+            frames = wav_file_check.getnframes()
+            rate = wav_file_check.getframerate()
             duration = frames / float(rate)
             
-            if duration <= 0.5:
-                print("The audio is too short, please try again.")
-                return
+        if duration <= 0.5:
+            print("The audio is too short, please try again.")
+            cl.user_session.set("audio_chunks", [])
+            return
 
+        # Reset buffer position again for transcription
+        wav_buffer.seek(0)
         audio_buffer = wav_buffer.getvalue()
+
+        # Clear audio chunks from session
+        cl.user_session.set("audio_chunks", [])
 
         input_audio_el = cl.Audio(content=audio_buffer, mime="audio/wav")
 
@@ -327,7 +294,8 @@ async def process_audio():
         output_name, output_audio, audio_url = await text_to_speech(answer, "audio/mp3")
 
         output_audio_el = cl.Audio(
-            url=audio_url if audio_url else None,
+            #get url from botnoi api response
+            url=audio_url,
             auto_play=True,
             mime="audio/mp3",
             content=output_audio,
@@ -339,15 +307,4 @@ async def process_audio():
 @cl.on_message
 async def on_message(message: cl.Message):
     await cl.Message(content="This is a voice demo, press P to start!").send()
-
-
-# Health check endpoint for ALB
-
-
-if __name__ == "__main__":
-    # Log configuration info
-    logging.basicConfig(level=logging.INFO)
-    logging.info(f"AWS Region: {AWS_REGION}")
-    logging.info(f"S3 Bucket: {S3_BUCKET}")
-    logging.info(f"Botnoi API: {'Enabled' if BOTNOI_API_KEY else 'Disabled'}")
 

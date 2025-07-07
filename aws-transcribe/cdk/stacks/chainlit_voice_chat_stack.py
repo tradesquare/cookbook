@@ -175,23 +175,21 @@ class ChainlitVoiceChatStack(Stack):
         )
         
         # Amazon Transcribe permissions for speech-to-text conversion
-        # Supports both batch transcription and real-time streaming
+        # Converts uploaded audio files to text for processing
         role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=[
                     "transcribe:StartTranscriptionJob",  # Start async transcription job
                     "transcribe:GetTranscriptionJob",    # Check job status and get results
-                    "transcribe:DeleteTranscriptionJob", # Clean up completed jobs (optional)
-                    "transcribe:StartStreamTranscription", # Start real-time streaming transcription
-                    "transcribe:StartStreamTranscriptionWebSocket" # Start WebSocket streaming transcription
+                    "transcribe:DeleteTranscriptionJob"  # Clean up completed jobs (optional)
                 ],
                 resources=["*"]  # Transcribe jobs don't have specific ARNs
             )
         )
         
         # Amazon Bedrock permissions for AI model inference
-        # Uses Claude 3.5 Sonnet for generating intelligent responses
+        # Uses Claude 3 Sonnet for generating intelligent responses
         role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -199,9 +197,8 @@ class ChainlitVoiceChatStack(Stack):
                     "bedrock:InvokeModel"  # Call the AI model with prompts
                 ],
                 resources=[
-                    # Claude 3.5 Sonnet model ARN (used in application)
-                    f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0",
-                    # Claude 3 Sonnet model ARN (fallback)
+                    # Specific Claude 3 Sonnet model ARN
+                    # Format: arn:aws:bedrock:region::foundation-model/model-id
                     f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
                 ]
             )
@@ -394,7 +391,7 @@ class ChainlitVoiceChatStack(Stack):
             health_check=elbv2.HealthCheck(
                 enabled=True,  # Enable health checks
                 healthy_http_codes="200",  # Consider HTTP 200 as healthy
-                path="/",  # Check main Chainlit endpoint
+                path="/health",  # Check health endpoint of application
                 timeout=Duration.seconds(10),  # Wait 10 seconds for response
                 interval=Duration.seconds(30),  # Check every 30 seconds
                 healthy_threshold_count=2,  # 2 consecutive successes = healthy

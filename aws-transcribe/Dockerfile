@@ -17,15 +17,13 @@ RUN apt-get update && apt-get install -y \
     g++ \
     build-essential \
     curl \
-    portaudio19-dev \
-    alsa-utils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
 # Copy requirements and install Python dependencies
-COPY requirements-aws.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements-aws.txt
+    pip install --no-cache-dir -r requirements.txt
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
@@ -34,10 +32,7 @@ USER app
 
 # Copy application files (ensure proper ownership)
 COPY --chown=app:app app-streaming.py .
-
-# Chainlit will work without these optional config files
-# Create empty .chainlit directory for any future config
-RUN mkdir -p .chainlit
+COPY --chown=app:app chainlit.md .
 
 # Expose port
 EXPOSE 8000
@@ -45,10 +40,6 @@ EXPOSE 8000
 # Set environment variables
 ENV CHAINLIT_HOST=0.0.0.0
 ENV CHAINLIT_PORT=8000
-
-# Health check for container (check main Chainlit endpoint)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/ || exit 1
 
 # Run the application
 CMD ["python", "-m", "chainlit", "run", "app-streaming.py", "--host", "0.0.0.0", "--port", "8000"]

@@ -15,5 +15,7 @@
     "us-east-1e",
     "us-east-1f"
   ],
-  "cli-telemetry": true
+  "acknowledged-issue-numbers": [
+    34892
+  ]
 }
