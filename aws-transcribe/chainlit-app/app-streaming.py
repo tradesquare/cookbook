@@ -18,21 +18,33 @@ from amazon_transcribe.model import TranscriptEvent
 
 import chainlit as cl
 
-AWS_PROFILE = os.getenv("PROFILE")
+# แก้ไขการจัดการ AWS credentials
+import os
+import boto3
+
+# ลบบรรทัดนี้ออกสำหรับ ECS deployment
+# boto3.setup_default_session(profile_name=AWS_PROFILE)
+
+# ใช้ environment variables แทน profile
+aws_region = os.getenv("AWS_REGION", "us-east-1")
+
+# สร้าง client โดยไม่ระบุ profile
+bedrock_client = boto3.client('bedrock-runtime', region_name=aws_region)
+
+# แก้ไข environment variable validation
 BOTNOI_API_KEY = os.getenv("BOTNOI_API_KEY")
+if not BOTNOI_API_KEY:
+    raise ValueError("BOTNOI_API_KEY must be set")
 
-boto3.setup_default_session(profile_name=AWS_PROFILE)
+# เพิ่ม health check endpoint (optional)
+@cl.on_chat_start
+async def start():
+    cl.user_session.set("message_history", [])
+    await cl.Message(
+        content="Welcome to Chainlit x AWS example! Press `p` to talk!",
+    ).send()
 
-session = boto3.Session(profile_name=AWS_PROFILE)
-bedrock_client = session.client('bedrock-runtime')
-
-# Get AWS region from session
-aws_region = session.region_name or 'us-east-1'
-
-if not AWS_PROFILE or not BOTNOI_API_KEY:
-    raise ValueError(
-        "PROFILE and BOTNOI_API_KEY must be set"
-    )
+# หรือเพิ่ม HTTP endpoint สำหรับ health check
 
 class TranscribeEventHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream):
@@ -55,39 +67,42 @@ SILENCE_TIMEOUT = 3000.0  # Milliseconds of silence to consider the turn finishe
 
 @cl.step(type="tool")
 async def speech_to_text(audio_buffer):
-    #
-    # Set up streaming client
-    client = TranscribeStreamingClient(region=aws_region)
+    try:
+        # Set up streaming client
+        client = TranscribeStreamingClient(region=aws_region)
     
-    # Start stream transcription
-    stream = await client.start_stream_transcription(
-        language_code="th-TH",
-        #language_code="en-US",
-        #identify_multiple_languages=True,
-        #language_options=["th-TH", "en-US"],
-        media_sample_rate_hz=24000,
-        media_encoding="pcm",
-    )
+        # Start stream transcription
+        stream = await client.start_stream_transcription(
+            language_code="th-TH",
+            #language_code="en-US",
+            #identify_multiple_languages=True,
+            #language_options=["th-TH", "en-US"],
+            media_sample_rate_hz=24000,
+            media_encoding="pcm",
+        )
     
-    # Create event handler
-    handler = TranscribeEventHandler(stream.output_stream)
+        # Create event handler
+        handler = TranscribeEventHandler(stream.output_stream)
     
-    async def send_audio():
-        # Convert WAV buffer to PCM chunks
-        wav_io = io.BytesIO(audio_buffer)
-        with wave.open(wav_io, 'rb') as wav_file:
-            chunk_size = 1024 * 2  # 2KB chunks
-            while True:
-                chunk = wav_file.readframes(chunk_size)
-                if not chunk:
-                    break
-                await stream.input_stream.send_audio_event(audio_chunk=chunk)
-        await stream.input_stream.end_stream()
+        async def send_audio():
+            # Convert WAV buffer to PCM chunks
+            wav_io = io.BytesIO(audio_buffer)
+            with wave.open(wav_io, 'rb') as wav_file:
+                chunk_size = 1024 * 2  # 2KB chunks
+                while True:
+                    chunk = wav_file.readframes(chunk_size)
+                    if not chunk:
+                        break
+                    await stream.input_stream.send_audio_event(audio_chunk=chunk)
+            await stream.input_stream.end_stream()
     
-    # Process audio and handle events concurrently
-    await asyncio.gather(send_audio(), handler.handle_events())
+        # Process audio and handle events concurrently
+        await asyncio.gather(send_audio(), handler.handle_events())
     
-    return handler.transcript_text.strip()
+        return handler.transcript_text.strip()
+    except Exception as e:
+        logging.error(f"Speech to text error: {str(e)}")
+        return "Sorry, I couldn't process your audio."
 
 
 @cl.step(type="tool")
@@ -177,14 +192,6 @@ async def generate_text_answer(transcription):
     message_history.append({"role": "assistant", "content": assistant_message})
     
     return assistant_message
-
-
-@cl.on_chat_start
-async def start():
-    cl.user_session.set("message_history", [])
-    await cl.Message(
-        content="Welcome to Chainlit x AWS example! Press `p` to talk!",
-    ).send()
 
 
 @cl.on_audio_start
@@ -302,6 +309,13 @@ async def process_audio():
         )
 
         await cl.Message(content=answer, elements=[output_audio_el]).send()
+
+
+@cl.on_audio_end
+async def on_audio_end():
+    """จัดการเมื่อผู้ใช้กดปุ่ม 'p' เพื่อหยุดการบันทึกเสียง"""
+    # ประมวลผลเสียงที่บันทึกได้
+    await process_audio()
 
 
 @cl.on_message

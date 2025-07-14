@@ -1,5 +1,6 @@
 # Use explicit platform for ECS compatibility
-FROM --platform=linux/amd64 python:3.11-slim
+ARG TARGETPLATFORM=linux/amd64
+FROM --platform=$TARGETPLATFORM python:3.11-slim
 
 # Set Python environment variables for production
 ENV PYTHONUNBUFFERED=1
@@ -40,6 +41,14 @@ EXPOSE 8000
 # Set environment variables
 ENV CHAINLIT_HOST=0.0.0.0
 ENV CHAINLIT_PORT=8000
+
+# เพิ่ม health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/ || exit 1
+
+# หรือใช้ python script สำหรับ health check
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+#   CMD python -c "import requests; requests.get('http://localhost:8000')"
 
 # Run the application
 CMD ["python", "-m", "chainlit", "run", "app-streaming.py", "--host", "0.0.0.0", "--port", "8000"]

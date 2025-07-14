@@ -272,7 +272,8 @@ class ChainlitVoiceChatStack(Stack):
             "ChainlitContainer",  # Container name
             # Build Docker image from parent directory (../)
             # Expects Dockerfile in the parent directory
-            image=ecs.ContainerImage.from_asset(".."),
+            # image=ecs.ContainerImage.from_asset(".."),
+            image=ecs.ContainerImage.from_asset("../chainlit-app"),  
             # Configure CloudWatch logging
             logging=ecs.LogDrivers.aws_logs(
                 stream_prefix="chainlit",  # Log stream prefix
@@ -280,10 +281,11 @@ class ChainlitVoiceChatStack(Stack):
             ),
             # Environment variables passed to container
             environment={
-                "AWS_REGION": self.region,  # Current AWS region (e.g., us-east-1)
-                "S3_BUCKET": self.audio_bucket.bucket_name,  # S3 bucket for audio files
-                "CHAINLIT_HOST": "0.0.0.0",  # Listen on all interfaces
-                "CHAINLIT_PORT": "8000"  # Application port
+                "AWS_REGION": self.region,
+                "S3_BUCKET": self.audio_bucket.bucket_name,
+                "CHAINLIT_HOST": "0.0.0.0",
+                "CHAINLIT_PORT": "8000",
+                "BOTNOI_API_KEY": "sSMhG5vhfD5Wa5xAjpOpeigRaorNdTDL" 
             },
             # Port mapping for network access
             port_mappings=[
@@ -391,7 +393,7 @@ class ChainlitVoiceChatStack(Stack):
             health_check=elbv2.HealthCheck(
                 enabled=True,  # Enable health checks
                 healthy_http_codes="200",  # Consider HTTP 200 as healthy
-                path="/health",  # Check health endpoint of application
+                path="/",  # เปลี่ยนจาก "/health" เป็น "/"
                 timeout=Duration.seconds(10),  # Wait 10 seconds for response
                 interval=Duration.seconds(30),  # Check every 30 seconds
                 healthy_threshold_count=2,  # 2 consecutive successes = healthy

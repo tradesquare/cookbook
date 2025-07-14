@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  chainlit-voice-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - AWS_REGION=us-east-1
+      - S3_BUCKET=chainlit-voice-chat-audio-local-test
+      - CHAINLIT_HOST=0.0.0.0
+      - CHAINLIT_PORT=8000
+      - BOTNOI_API_KEY=sSMhG5vhfD5Wa5xAjpOpeigRaorNdTDL
+    volumes:
+      # Mount AWS credentials from host (optional)
+      - ~/.aws:/home/app/.aws:ro
+    networks:
+      - chainlit-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  chainlit-network:
+    driver: bridge 
